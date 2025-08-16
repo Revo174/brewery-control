@@ -1,0 +1,896 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ESPAsyncWiFiManager.h>
+#include <LittleFS.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <PID_v1.h>
+#include <DFRobotDFPlayerMini.h>
+#include <ArduinoJson.h>
+#include <WebSocketsServer.h>
+#include <EEPROM.h>
+#include <vector>
+
+// Конфигурация оборудования
+#define TEC_PIN 25          // ШИМ для ТЭНа (SSR управление)
+#define PUMP_PIN 26         // Реле насоса
+#define VALVE_PIN 27        // Клапан чиллера
+#define STIRRER_PIN 14      // Мешалка
+#define ONE_WIRE_BUS 32     // DS18B20
+#define BUTTON_MASH 33      // Кнопка старта затирания
+#define BUTTON_BOIL 34      // Кнопка старта кипячения
+#define BTN_UP 35           // Кнопка +
+#define BTN_DOWN 36         // Кнопка -
+#define MP3_RX 16
+#define MP3_TX 17
+// #define ALISA_MIC 39        // Аналоговый микрофон (не используется в текущей реализации)
+
+// Объекты системы
+AsyncWebServer server(80);
+WebSocketsServer webSocket(81);
+DNSServer dns;
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+DFRobotDFPlayerMini mp3;
+double inputTemp, setpoint, outputPower; // Для PID
+PID heaterPID(&inputTemp, &outputPower, &setpoint, 2, 5, 1, DIRECT);
+
+// Структуры данных
+struct HopAddition {
+  String name;
+  unsigned int time;
+  float amount;
+  float alpha;
+};
+
+struct MashStep {
+  String name;
+  float temperature;
+  unsigned int duration;
+  bool completed = false;
+};
+
+struct Recipe {
+  String name;
+  std::vector<MashStep> mashSteps;
+  std::vector<HopAddition> hops;
+  unsigned int boilTime;
+  float batchSize;
+  float efficiency;
+  float estimatedIBU;
+};
+
+// Глобальные состояния
+enum BrewState { IDLE, MASHING, BOILING, COOLING };
+BrewState currentState = IDLE;
+Recipe currentRecipe;
+std::vector<Recipe> recipes;
+unsigned long stepStartTime = 0;
+int currentStep = -1;
+int currentHopAddition = 0;
+bool pumpState = false;
+bool valveState = false;
+bool stirrerState = true;
+unsigned long boilStartTime = 0;
+String yandexToken = "";
+
+// Настройки PID
+struct PIDConfig {
+  double Kp = 2.0;
+  double Ki = 5.0;
+  double Kd = 1.0;
+} pidConfig;
+
+// Системные параметры
+struct SystemConfig {
+  char wifiSSID[32] = "";
+  char wifiPass[32] = "";
+  int pumpOffTemp = 98;
+  int tecMaxPower = 100;
+} sysConfig;
+
+// Прототипы функций
+void initHardware();
+void initMP3Player();
+void initWiFi();
+void loadSystemConfig();
+void saveSystemConfig();
+void loadRecipes();
+void saveRecipe(const Recipe& recipe);
+void serializeRecipes(String& output);
+bool deserializeRecipe(const String& json, Recipe& recipe);
+void startMashing();
+void nextMashStep();
+void completeMashing();
+void startBoiling();
+void addHop(int index);
+void completeBoiling();
+void startCooling();
+void completeCooling();
+void setPumpState(bool state);
+void setValveState(bool state);
+void setStirrerState(bool state);
+void processMashing();
+void processBoiling();
+void processCooling();
+void processButtons();
+void sendSystemUpdate();
+void playSound(int track);
+void calculateIBU();
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+void handleWebServer();
+void saveBrewState();
+void restoreBrewState();
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Инициализация оборудования
+  initHardware();
+  
+  // Файловая система
+  if(!LittleFS.begin()) {
+    Serial.println("Форматирование LittleFS...");
+    LittleFS.format();
+    LittleFS.begin();
+  }
+  
+  // Загрузка конфигураций
+  loadSystemConfig();
+  loadRecipes();
+  
+  // Сеть
+  initWiFi();
+  
+  // Веб-интерфейс
+  handleWebServer();
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  
+  // Температура
+  sensors.begin();
+  sensors.setResolution(12);
+  
+  // PID
+  heaterPID.SetMode(AUTOMATIC);
+  heaterPID.SetOutputLimits(0, sysConfig.tecMaxPower);
+  heaterPID.SetTunings(pidConfig.Kp, pidConfig.Ki, pidConfig.Kd);
+  
+  // Звук
+  initMP3Player();
+  
+  // Восстановление состояния
+  restoreBrewState();
+  
+  Serial.println("Система готова");
+  playSound(1); // Звук запуска системы
+}
+
+void loop() {
+  // Обновление сенсоров
+  static unsigned long lastTempUpdate = 0;
+  if(millis() - lastTempUpdate > 1000) {
+    sensors.requestTemperatures();
+    inputTemp = sensors.getTempCByIndex(0);
+    lastTempUpdate = millis();
+    
+    // Обновление IBU во время кипячения
+    if(currentState == BOILING) {
+      calculateIBU();
+    }
+  }
+  
+  // Обработка состояний
+  switch(currentState) {
+    case MASHING: processMashing(); break;
+    case BOILING: processBoiling(); break;
+    case COOLING: processCooling(); break;
+    default: break;
+  }
+  
+  // Управление мощностью
+  if(currentState != IDLE) {
+    heaterPID.Compute();
+    analogWrite(TEC_PIN, map(outputPower, 0, 100, 0, 255));
+  }
+  
+  // Обработка кнопок
+  processButtons();
+  
+  // Веб-сокет обновление
+  static unsigned long lastWsUpdate = 0;
+  if(millis() - lastWsUpdate > 1000) {
+    sendSystemUpdate();
+    lastWsUpdate = millis();
+  }
+  
+  // Обработка веб-сокетов
+  webSocket.loop();
+  
+  delay(10);
+}
+
+// Инициализация оборудования
+void initHardware() {
+  analogWriteResolution(8);
+  pinMode(TEC_PIN, OUTPUT);
+  digitalWrite(TEC_PIN, LOW);
+  
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW);
+  
+  pinMode(VALVE_PIN, OUTPUT);
+  digitalWrite(VALVE_PIN, LOW);
+  
+  pinMode(STIRRER_PIN, OUTPUT);
+  digitalWrite(STIRRER_PIN, LOW);
+  
+  pinMode(BUTTON_MASH, INPUT_PULLUP);
+  pinMode(BUTTON_BOIL, INPUT_PULLUP);
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  
+  EEPROM.begin(512);
+}
+
+void initMP3Player() {
+  Serial2.begin(9600, SERIAL_8N1, MP3_RX, MP3_TX);
+  delay(1000);
+  
+  if(!mp3.begin(Serial2)) {
+    Serial.println("Ошибка инициализации MP3 плеера!");
+    return;
+  }
+  
+  mp3.setVolume(25);
+  Serial.println("MP3 плеер инициализирован");
+}
+
+void initWiFi() {
+  WiFi.mode(WIFI_STA);
+  
+  AsyncWiFiManager wifiManager(&server, &dns);
+  
+  // Параметры для конфигурации WiFi
+  wifiManager.setConfigPortalTimeout(180);
+  
+  if(!wifiManager.autoConnect("BrewController")) {
+    Serial.println("Не удалось подключиться и запустить точку доступа");
+    ESP.restart();
+  }
+  
+  Serial.println("Подключено к WiFi!");
+  Serial.print("IP адрес: ");
+  Serial.println(WiFi.localIP());
+}
+
+void loadSystemConfig() {
+  if(EEPROM.read(0) != 255) { // Проверка на инициализацию EEPROM
+    EEPROM.get(0, sysConfig);
+    EEPROM.get(sizeof(sysConfig), pidConfig);
+  }
+  
+  // Проверка загруженных значений
+  if(sysConfig.tecMaxPower <= 0 || sysConfig.tecMaxPower > 100) {
+    sysConfig.tecMaxPower = 100;
+  }
+  
+  Serial.println("Системные настройки загружены");
+}
+
+void saveSystemConfig() {
+  EEPROM.put(0, sysConfig);
+  EEPROM.put(sizeof(sysConfig), pidConfig);
+  EEPROM.commit();
+  Serial.println("Системные настройки сохранены");
+}
+
+void loadRecipes() {
+  File dir = LittleFS.open("/recipes");
+  if(!dir) {
+    Serial.println("Папка рецептов не найдена");
+    return;
+  }
+  
+  File file = dir.openNextFile();
+  while(file) {
+    if(!file.isDirectory() && String(file.name()).endsWith(".json")) {
+      String json = file.readString();
+      Recipe recipe;
+      if(deserializeRecipe(json, recipe)) {
+        recipes.push_back(recipe);
+        Serial.println("Загружен рецепт: " + recipe.name);
+      }
+    }
+    file = dir.openNextFile();
+  }
+  dir.close();
+}
+
+bool deserializeRecipe(const String& json, Recipe& recipe) {
+  DynamicJsonDocument doc(2048);
+  DeserializationError error = deserializeJson(doc, json);
+  
+  if(error) {
+    Serial.print("Ошибка десериализации рецепта: ");
+    Serial.println(error.c_str());
+    return false;
+  }
+  
+  recipe.name = doc["name"].as<String>();
+  recipe.boilTime = doc["boilTime"];
+  recipe.batchSize = doc["batchSize"];
+  recipe.efficiency = doc["efficiency"];
+  recipe.estimatedIBU = doc["estimatedIBU"];
+  
+  JsonArray steps = doc["mashSteps"];
+  for(JsonObject step : steps) {
+    MashStep s;
+    s.name = step["name"].as<String>();
+    s.temperature = step["temperature"];
+    s.duration = step["duration"];
+    recipe.mashSteps.push_back(s);
+  }
+  
+  JsonArray hops = doc["hops"];
+  for(JsonObject hop : hops) {
+    HopAddition h;
+    h.name = hop["name"].as<String>();
+    h.time = hop["time"];
+    h.amount = hop["amount"];
+    h.alpha = hop["alpha"];
+    recipe.hops.push_back(h);
+  }
+  
+  return true;
+}
+
+void serializeRecipes(String& output) {
+  DynamicJsonDocument doc(4096);
+  JsonArray array = doc.to<JsonArray>();
+  
+  for(Recipe &r : recipes) {
+    JsonObject recipe = array.createNestedObject();
+    recipe["name"] = r.name;
+    recipe["boilTime"] = r.boilTime;
+    recipe["batchSize"] = r.batchSize;
+    recipe["efficiency"] = r.efficiency;
+    recipe["estimatedIBU"] = r.estimatedIBU;
+    
+    JsonArray steps = recipe.createNestedArray("mashSteps");
+    for(MashStep &s : r.mashSteps) {
+      JsonObject step = steps.createNestedObject();
+      step["name"] = s.name;
+      step["temperature"] = s.temperature;
+      step["duration"] = s.duration;
+    }
+    
+    JsonArray hops = recipe.createNestedArray("hops");
+    for(HopAddition &h : r.hops) {
+      JsonObject hop = hops.createNestedObject();
+      hop["name"] = h.name;
+      hop["time"] = h.time;
+      hop["amount"] = h.amount;
+      hop["alpha"] = h.alpha;
+    }
+  }
+  
+  serializeJson(doc, output);
+}
+
+void saveRecipe(const Recipe& recipe) {
+  // Поиск существующего рецепта
+  for(auto& r : recipes) {
+    if(r.name == recipe.name) {
+      r = recipe;
+      break;
+    }
+  }
+  
+  // Сохранение в файл
+  String filename = "/recipes/" + recipe.name + ".json";
+  File file = LittleFS.open(filename, "w");
+  if(!file) {
+    Serial.println("Ошибка открытия файла для записи");
+    return;
+  }
+  
+  DynamicJsonDocument doc(2048);
+  doc["name"] = recipe.name;
+  doc["boilTime"] = recipe.boilTime;
+  doc["batchSize"] = recipe.batchSize;
+  doc["efficiency"] = recipe.efficiency;
+  doc["estimatedIBU"] = recipe.estimatedIBU;
+  
+  JsonArray steps = doc.createNestedArray("mashSteps");
+  for(const MashStep &s : recipe.mashSteps) {
+    JsonObject step = steps.createNestedObject();
+    step["name"] = s.name;
+    step["temperature"] = s.temperature;
+    step["duration"] = s.duration;
+  }
+  
+  JsonArray hops = doc.createNestedArray("hops");
+  for(const HopAddition &h : recipe.hops) {
+    JsonObject hop = hops.createNestedObject();
+    hop["name"] = h.name;
+    hop["time"] = h.time;
+    hop["amount"] = h.amount;
+    hop["alpha"] = h.alpha;
+  }
+  
+  if(serializeJson(doc, file) == 0) {
+    Serial.println("Ошибка записи рецепта");
+  }
+  
+  file.close();
+}
+
+void startMashing() {
+  if(recipes.empty()) return;
+  
+  // Используем первый рецепт для примера
+  currentRecipe = recipes[0];
+  currentState = MASHING;
+  currentStep = -1;
+  nextMashStep();
+  saveBrewState();
+  
+  Serial.println("Начато затирание: " + currentRecipe.name);
+  playSound(2);
+}
+
+void nextMashStep() {
+  if(currentStep >= 0) {
+    currentRecipe.mashSteps[currentStep].completed = true;
+  }
+  
+  currentStep++;
+  if(currentStep < currentRecipe.mashSteps.size()) {
+    stepStartTime = millis();
+    setpoint = currentRecipe.mashSteps[currentStep].temperature;
+    setPumpState(true); // Включаем насос для циркуляции
+    
+    Serial.println("Переход к шагу: " + currentRecipe.mashSteps[currentStep].name);
+    playSound(3);
+  } else {
+    completeMashing();
+  }
+}
+
+void completeMashing() {
+  currentState = IDLE;
+  setPumpState(false);
+  clearBrewState();
+  
+  Serial.println("Затирание завершено");
+  playSound(4);
+}
+
+void startBoiling() {
+  if(currentRecipe.name == "") return;
+  
+  currentState = BOILING;
+  boilStartTime = millis();
+  currentHopAddition = 0;
+  setpoint = 100; // Температура кипения
+  setPumpState(true);
+  saveBrewState();
+  
+  Serial.println("Начато кипячение");
+  playSound(5);
+}
+
+void addHop(int index) {
+  if(index < 0 || index >= currentRecipe.hops.size()) return;
+  
+  HopAddition& hop = currentRecipe.hops[index];
+  // Здесь должна быть логика добавления хмеля
+  // Например, управление сервомотором или сигнал оператору
+  
+  Serial.println("Добавлен хмель: " + hop.name);
+  playSound(6);
+}
+
+void completeBoiling() {
+  currentState = COOLING;
+  boilStartTime = 0;
+  setPumpState(false);
+  saveBrewState();
+  
+  Serial.println("Кипячение завершено");
+  playSound(7);
+}
+
+void startCooling() {
+  currentState = COOLING;
+  setpoint = 20; // Целевая температура охлаждения
+  setValveState(true); // Открываем клапан чиллера
+  setPumpState(true);  // Включаем насос для циркуляции
+  saveBrewState();
+  
+  Serial.println("Начато охлаждение");
+  playSound(8);
+}
+
+void completeCooling() {
+  currentState = IDLE;
+  setValveState(false);
+  setPumpState(false);
+  clearBrewState();
+  
+  Serial.println("Охлаждение завершено");
+  playSound(9);
+}
+
+void setPumpState(bool state) {
+  digitalWrite(PUMP_PIN, state ? HIGH : LOW);
+  pumpState = state;
+}
+
+void setValveState(bool state) {
+  digitalWrite(VALVE_PIN, state ? HIGH : LOW);
+  valveState = state;
+}
+
+void setStirrerState(bool state) {
+  digitalWrite(STIRRER_PIN, state ? HIGH : LOW);
+  stirrerState = state;
+}
+
+void processMashing() {
+  if(currentStep < 0 || currentStep >= currentRecipe.mashSteps.size()) return;
+  
+  MashStep& step = currentRecipe.mashSteps[currentStep];
+  
+  // Проверка завершения шага
+  unsigned long elapsed = (millis() - stepStartTime) / 60000;
+  if(elapsed >= step.duration) {
+    nextMashStep();
+  }
+}
+
+void processBoiling() {
+  // Расчет оставшегося времени
+  unsigned long elapsed = (millis() - boilStartTime) / 60000;
+  unsigned long remaining = currentRecipe.boilTime - elapsed;
+  
+  // Автоматическое добавление хмеля
+  for(int i = currentHopAddition; i < currentRecipe.hops.size(); i++) {
+    if(remaining <= currentRecipe.hops[i].time) {
+      addHop(i);
+      currentHopAddition = i + 1;
+      break;
+    }
+  }
+  
+  // Автоматическое отключение насоса при высокой температуре
+  if(inputTemp >= sysConfig.pumpOffTemp && pumpState) {
+    setPumpState(false);
+  }
+  
+  // Завершение кипячения
+  if(remaining <= 0) {
+    completeBoiling();
+  }
+}
+
+void processCooling() {
+  // Автоматическое отключение клапана при достижении температуры
+  if(inputTemp <= 25.0 && valveState) {
+    setValveState(false);
+  }
+  
+  // Завершение охлаждения
+  if(inputTemp <= 20.0) {
+    completeCooling();
+  }
+}
+
+void processButtons() {
+  static unsigned long lastButtonPress = 0;
+  if(millis() - lastButtonPress < 300) return; // Защита от дребезга
+  
+  // Кнопка старта затирания
+  if(digitalRead(BUTTON_MASH) == LOW) {
+    if(currentState == IDLE) {
+      startMashing();
+      lastButtonPress = millis();
+    }
+  }
+  
+  // Кнопка старта кипячения
+  if(digitalRead(BUTTON_BOIL) == LOW) {
+    if(currentState == MASHING || currentState == IDLE) {
+      startBoiling();
+      lastButtonPress = millis();
+    }
+  }
+  
+  // Кнопки управления мощностью
+  if(digitalRead(BTN_UP) == LOW) {
+    outputPower = constrain(outputPower + 5, 0, sysConfig.tecMaxPower);
+    lastButtonPress = millis();
+  }
+  
+  if(digitalRead(BTN_DOWN) == LOW) {
+    outputPower = constrain(outputPower - 5, 0, sysConfig.tecMaxPower);
+    lastButtonPress = millis();
+  }
+}
+
+void sendSystemUpdate() {
+  DynamicJsonDocument doc(512);
+  doc["state"] = static_cast<int>(currentState);
+  doc["temp"] = inputTemp;
+  doc["setpoint"] = setpoint;
+  doc["power"] = outputPower;
+  doc["pump"] = pumpState;
+  doc["valve"] = valveState;
+  
+  if(currentState == MASHING && currentStep >= 0) {
+    doc["step"] = currentRecipe.mashSteps[currentStep].name;
+    unsigned long elapsed = (millis() - stepStartTime) / 60000;
+    doc["stepTime"] = elapsed;
+    doc["stepTotal"] = currentRecipe.mashSteps[currentStep].duration;
+  }
+  
+  if(currentState == BOILING) {
+    doc["boilTime"] = (millis() - boilStartTime) / 60000;
+    doc["boilTotal"] = currentRecipe.boilTime;
+    doc["ibu"] = currentRecipe.estimatedIBU;
+  }
+  
+  String json;
+  serializeJson(doc, json);
+  webSocket.broadcastTXT(json);
+}
+
+void playSound(int track) {
+  if(mp3.begin(Serial2)) { // Проверяем инициализацию плеера
+    mp3.play(track);
+    delay(300); // Задержка для стабильности
+  }
+}
+
+void calculateIBU() {
+  if(currentRecipe.hops.empty()) return;
+  
+  float ibu = 0.0;
+  unsigned long boilTime = (millis() - boilStartTime) / 60000;
+  
+  for(const HopAddition& hop : currentRecipe.hops) {
+    if(hop.time > boilTime) continue; // Хмель еще не добавлен
+    
+    float utilization = 1.65 * pow(0.000125, (100 - inputTemp)) * 
+                       (1 - exp(-0.04 * hop.time)) / 4.15;
+    ibu += (hop.amount * hop.alpha * utilization * 75) / 
+           currentRecipe.batchSize;
+  }
+  
+  currentRecipe.estimatedIBU = ibu;
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.printf("[%u] Отключен\n", num);
+      break;
+    case WStype_CONNECTED:
+      {
+        IPAddress ip = webSocket.remoteIP(num);
+        Serial.printf("[%u] Подключен из %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
+        sendSystemUpdate(); // Отправляем текущее состояние
+      }
+      break;
+    case WStype_TEXT:
+      handleWebSocketCommand(num, (char*)payload);
+      break;
+    default:
+      break;
+  }
+}
+
+void handleWebSocketCommand(uint8_t num, const char* payload) {
+  DynamicJsonDocument doc(256);
+  DeserializationError error = deserializeJson(doc, payload);
+  
+  if(error) {
+    Serial.print("Ошибка парсинга JSON: ");
+    Serial.println(error.c_str());
+    return;
+  }
+  
+  const char* action = doc["action"];
+  
+  if(strcmp(action, "startMash") == 0) {
+    startMashing();
+  }
+  else if(strcmp(action, "startBoil") == 0) {
+    startBoiling();
+  }
+  else if(strcmp(action, "startCool") == 0) {
+    startCooling();
+  }
+  else if(strcmp(action, "setPower") == 0) {
+    outputPower = doc["value"];
+  }
+  else if(strcmp(action, "setPump") == 0) {
+    setPumpState(doc["state"]);
+  }
+  else if(strcmp(action, "setValve") == 0) {
+    setValveState(doc["state"]);
+  }
+  else if(strcmp(action, "nextStep") == 0) {
+    nextMashStep();
+  }
+  else if(strcmp(action, "saveRecipe") == 0) {
+    Recipe r;
+    if(deserializeRecipe(doc["recipe"].as<String>(), r)) {
+      saveRecipe(r);
+      loadRecipes(); // Перезагружаем рецепты
+    }
+  }
+}
+
+void handleWebServer() {
+  // API рецептов
+  server.on("/api/recipes", HTTP_GET, [](AsyncWebServerRequest *request){
+    String json;
+    serializeRecipes(json);
+    request->send(200, "application/json", json);
+  });
+  
+  server.on("/api/saveRecipe", HTTP_POST, [](AsyncWebServerRequest *request){
+    if(request->hasParam("recipe", true)) {
+      Recipe r;
+      String recipeJson = request->getParam("recipe", true)->value();
+      if(deserializeRecipe(recipeJson, r)) {
+        saveRecipe(r);
+        request->send(200);
+      } else {
+        request->send(400, "text/plain", "Invalid recipe format");
+      }
+    } else {
+      request->send(400, "text/plain", "Missing recipe parameter");
+    }
+  });
+  
+  // API управления
+  server.on("/api/setPower", HTTP_GET, [](AsyncWebServerRequest *request){
+    if(request->hasParam("value")) {
+      outputPower = request->getParam("value")->value().toFloat();
+      request->send(200);
+    } else {
+      request->send(400, "text/plain", "Missing value parameter");
+    }
+  });
+  
+  server.on("/api/setPump", HTTP_GET, [](AsyncWebServerRequest *request){
+    if(request->hasParam("state")) {
+      setPumpState(request->getParam("state")->value() == "true");
+      request->send(200);
+    } else {
+      request->send(400, "text/plain", "Missing state parameter");
+    }
+  });
+  
+  // Настройки
+  server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest *request){
+    DynamicJsonDocument doc(1024);
+    doc["pumpOffTemp"] = sysConfig.pumpOffTemp;
+    doc["tecMaxPower"] = sysConfig.tecMaxPower;
+    doc["Kp"] = pidConfig.Kp;
+    doc["Ki"] = pidConfig.Ki;
+    doc["Kd"] = pidConfig.Kd;
+    
+    String json;
+    serializeJson(doc, json);
+    request->send(200, "application/json", json);
+  });
+  
+  server.on("/api/saveConfig", HTTP_POST, [](AsyncWebServerRequest *request){
+    if(request->hasParam("config", true)) {
+      DynamicJsonDocument doc(256);
+      DeserializationError error = deserializeJson(doc, request->getParam("config", true)->value());
+      
+      if(!error) {
+        sysConfig.pumpOffTemp = doc["pumpOffTemp"] | 98;
+        sysConfig.tecMaxPower = doc["tecMaxPower"] | 100;
+        pidConfig.Kp = doc["Kp"] | 2.0;
+        pidConfig.Ki = doc["Ki"] | 5.0;
+        pidConfig.Kd = doc["Kd"] | 1.0;
+        
+        saveSystemConfig();
+        heaterPID.SetTunings(pidConfig.Kp, pidConfig.Ki, pidConfig.Kd);
+        request->send(200);
+      } else {
+        request->send(400, "text/plain", "Invalid config format");
+      }
+    } else {
+      request->send(400, "text/plain", "Missing config parameter");
+    }
+  });
+  
+  // Статические файлы
+  server.serveStatic("/", LittleFS, "/www/").setDefaultFile("index.html");
+  
+  // Запуск сервера
+  server.begin();
+}
+
+void saveBrewState() {
+  EEPROM.write(0, 1); // Флаг активного процесса
+  
+  int address = 1;
+  EEPROM.write(address, static_cast<uint8_t>(currentState)); address++;
+  EEPROM.write(address, currentStep); address++;
+  
+  EEPROM.put(address, stepStartTime); address += sizeof(stepStartTime);
+  EEPROM.put(address, boilStartTime); address += sizeof(boilStartTime);
+  
+  // Сохраняем имя текущего рецепта
+  String recipeName = currentRecipe.name;
+  uint8_t nameLen = recipeName.length();
+  EEPROM.write(address, nameLen); address++;
+  
+  for(char c : recipeName) {
+    EEPROM.write(address++, c);
+  }
+  
+  EEPROM.commit();
+}
+
+void restoreBrewState() {
+  if(EEPROM.read(0) != 1) return; // Нет сохраненного состояния
+  
+  int address = 1;
+  currentState = static_cast<BrewState>(EEPROM.read(address)); address++;
+  currentStep = EEPROM.read(address); address++;
+  
+  EEPROM.get(address, stepStartTime); address += sizeof(stepStartTime);
+  EEPROM.get(address, boilStartTime); address += sizeof(boilStartTime);
+  
+  // Восстанавливаем рецепт
+  uint8_t nameLen = EEPROM.read(address); address++;
+  String recipeName;
+  for(int i = 0; i < nameLen; i++) {
+    recipeName += static_cast<char>(EEPROM.read(address++));
+  }
+  
+  // Поиск рецепта по имени
+  for(const auto& recipe : recipes) {
+    if(recipe.name == recipeName) {
+      currentRecipe = recipe;
+      break;
+    }
+  }
+  
+  Serial.println("Восстановлено состояние варки: " + recipeName);
+  
+  // Если было прервано затирание, продолжаем
+  if(currentState == MASHING && currentStep >= 0) {
+    setpoint = currentRecipe.mashSteps[currentStep].temperature;
+    setPumpState(true);
+  }
+  
+  // Если было прервано кипячение
+  if(currentState == BOILING) {
+    setpoint = 100;
+    setPumpState(true);
+  }
+  
+  // Если было прервано охлаждение
+  if(currentState == COOLING) {
+    setpoint = 20;
+    setPumpState(true);
+    setValveState(true);
+  }
+}
+
+void clearBrewState() {
+  EEPROM.write(0, 0);
+  EEPROM.commit();
+}
